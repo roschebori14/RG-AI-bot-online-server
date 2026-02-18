@@ -2,6 +2,9 @@
 import os
 import logging
 import requests
+import json
+import tempfile
+import speech_recognition as sr
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -17,6 +20,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from telegram import Voice, Document
 
 # Configure logging
 logging.basicConfig(
@@ -712,6 +716,12 @@ async def help2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /settings - Your preferences
 /clear - Clear chat
 
+📢 **Earn with RG Assistant:**
+/refer - Get referral link
+/ads - Monetization info
+/offers - Current deals
+/promote - Promote bot
+
 🎭 TONE COMMANDS:
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -830,18 +840,225 @@ Use /upgrade to see pricing or
 
 async def handle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photos"""
-    await update.message.reply_text(
-        "📷 Thanks for the image! Image analysis is coming soon.\n\n"
-        "For now, please send me text messages."
-    )
+    user_id = update.effective_user.id
+    
+    # Check user limits first
+    if not is_premium(user_id):
+        remaining = get_daily_remaining(user_id)
+        if remaining <= 0:
+            await update.message.reply_text(
+                "❌ You've reached your daily limit!\n\n"
+                "Use /upgrade for unlimited messages!"
+            )
+            return
+    
+    photo = update.message.photo
+    if photo:
+        # Get the largest photo
+        largest_photo = photo[-1]
+        file_size = largest_photo.file_size
+        
+        await update.message.reply_text(
+            f"📷 Image received!\n"
+            f"Size: {file_size / 1024:.1f} KB\n\n"
+            f"⚠️ Image analysis requires a vision AI API.\n\n"
+            f"For now, you can:\n"
+            f"• Describe what's in the image\n"
+            f"• Ask me to help with image-related questions\n\n"
+            f"Full image analysis coming soon!"
+        )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voice messages"""
+    """Handle voice messages - transcribe and process"""
+    user_id = update.effective_user.id
+    
+    # Check user limits first
+    if not is_premium(user_id):
+        remaining = get_daily_remaining(user_id)
+        if remaining <= 0:
+            await update.message.reply_text(
+                "❌ You've reached your daily limit!\n\n"
+                "Use /upgrade for unlimited messages!"
+            )
+            return
+    
+    await update.message.reply_text("🎤 Processing your voice message...")
+    
+    try:
+        voice = update.message.voice
+        
+        # Get file from Telegram
+        file = await context.bot.get_file(voice.file_id)
+        
+        # Download to temp file
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+            await file.download_to_drive(tmp_file.name)
+            ogg_path = tmp_file.name
+        
+        # Convert OGG to WAV using pydub
+        from pydub import AudioSegment
+        wav_path = ogg_path.replace(".ogg", ".wav")
+        
+        try:
+            sound = AudioSegment.from_ogg(ogg_path)
+            sound.export(wav_path, format="wav")
+        except Exception as e:
+            logger.error(f"Audio conversion error: {e}")
+            # Try direct download as wav
+            wav_path = ogg_path
+        
+        # Transcribe using SpeechRecognition
+        recognizer = sr.Recognizer()
+        
+        try:
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+                # Try Google Speech Recognition (free, no API key needed)
+                text = recognizer.recognize_google(audio_data)
+                
+            logger.info(f"Transcribed voice: {text}")
+            
+            # Clean up temp files
+            try:
+                os.remove(ogg_path)
+                if wav_path != ogg_path:
+                    os.remove(wav_path)
+            except:
+                pass
+            
+            # Now process the transcribed text as a regular message
+            await update.message.reply_text(
+                f"🎤 **You said:**\n{text}\n\nProcessing..."
+            )
+            
+            # Get AI response
+            await update.message.chat.send_action("typing")
+            
+            # Get conversation history
+            conversation_history = user_conversations.get(user_id, [])
+            ai_response = get_ai_response(text, user_id, conversation_history)
+            
+            # Save to conversation
+            if user_id not in user_conversations:
+                user_conversations[user_id] = []
+            user_conversations[user_id].append({"role": "user", "message": text})
+            user_conversations[user_id].append({"role": "chatbot", "message": ai_response})
+            if len(user_conversations[user_id]) > 20:
+                user_conversations[user_id] = user_conversations[user_id][-20:]
+            
+            # Send response
+            if len(ai_response) > 4096:
+                chunks = [ai_response[i:i+4096] for i in range(0, len(ai_response), 4096)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(ai_response)
+                
+        except sr.UnknownValueError:
+            await update.message.reply_text(
+                "😕 Couldn't understand the audio. Please try again with clearer speech!"
+            )
+        except sr.RequestError as e:
+            await update.message.reply_text(
+                f"⚠️ Speech service unavailable. Please try text instead!"
+            )
+            logger.error(f"Speech recognition error: {e}")
+            
+    except Exception as e:
+        logger.error(f"Voice processing error: {e}")
+        await update.message.reply_text(
+            "⚠️ Error processing voice. Please send as text!"
+        )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document/file messages"""
+    user_id = update.effective_user.id
+    
+    # Check user limits first
+    if not is_premium(user_id):
+        remaining = get_daily_remaining(user_id)
+        if remaining <= 0:
+            await update.message.reply_text(
+                "❌ You've reached your daily limit!\n\n"
+                "Use /upgrade for unlimited messages!"
+            )
+            return
+    
+    document = update.message.document
+    file_name = document.file_name or "file"
+    file_size = document.file_size
+    
+    # Check file size (limit to 10MB)
+    if file_size > 10 * 1024 * 1024:
+        await update.message.reply_text(
+            "📄 File too large! Please send files under 10MB."
+        )
+        return
+    
+    # Get file extension
+    file_ext = os.path.splitext(file_name)[1].lower() if file_name else ""
+    
     await update.message.reply_text(
-        "🎤 Thanks for the voice message! Voice transcription is coming soon.\n\n"
-        "For now, please send me text messages."
+        f"📄 Received: {file_name}\n"
+        f"Size: {file_size / 1024:.1f} KB\n\n"
+        f"Analyzing..."
     )
+    
+    try:
+        # Get file from Telegram
+        file = await context.bot.get_file(document.file_id)
+        
+        # Handle different file types
+        if file_ext in [".txt", ".py", ".js", ".html", ".css", ".json", ".md"]:
+            # Text files - read content
+            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False, mode='w') as tmp_file:
+                await file.download_to_drive(tmp_file.name)
+                
+                try:
+                    with open(tmp_file.name, 'r', encoding='utf-8') as f:
+                        content = f.read(5000)  # Limit to 5000 chars
+                    
+                    os.remove(tmp_file.name)
+                    
+                    # Analyze the code/file
+                    await update.message.chat.send_action("typing")
+                    prompt = f"Analyze this {file_ext} file:\n\n```{file_ext}\n{content}\n```\n\nCan you explain what this does?"
+                    
+                    conversation_history = user_conversations.get(user_id, [])
+                    ai_response = get_ai_response(prompt, user_id, conversation_history)
+                    
+                    await update.message.reply_text(ai_response)
+                    
+                except UnicodeDecodeError:
+                    await update.message.reply_text(
+                        "📄 Couldn't read this file (binary or encoding issue).\n"
+                        "Try sending as plain text!"
+                    )
+                    
+        elif file_ext in [".pdf"]:
+            # PDF files - need OCR or text extraction
+            await update.message.reply_text(
+                "📄 PDF files require special processing.\n"
+                "For now, please send the text content directly!\n\n"
+                "Tip: Copy-paste the text from PDF!"
+            )
+            
+        else:
+            # Other files - summarize what we know
+            await update.message.reply_text(
+                f"📄 File received: {file_name}\n\n"
+                f"This file type ({file_ext}) needs special processing.\n\n"
+                f"Would you like me to help you with something specific about this file?\n"
+                f"Or you can describe what's in it and I'll help!"
+            )
+            
+    except Exception as e:
+        logger.error(f"Document processing error: {e}")
+        await update.message.reply_text(
+            "⚠️ Error processing file. Please try again or send as text!"
+        )
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -896,6 +1113,9 @@ def main():
     
     # Voice messages
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    
+    # Document/File messages
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
     # Error handler
     application.add_error_handler(error_handler)
